@@ -1,0 +1,17 @@
+{
+    "traj_path": "../SHARC_NMA",
+    "read_from_xyz": true,
+    "code_name": "sharc",
+    "freq_path": "freq.molden",
+    "refstruc": "freq.molden", 
+    "reftype": "molden", 
+    "mass_weight": true, 
+    "atmnum" : [12.0107, 32.065, 32.065],
+    "numsteps": 2001, 
+    "timestep": 0.5, 
+    "plot": true,
+    "symmmodes": [], 
+    "negmodes": [], 
+    "interval": [[0,1000], [1000, 2000]],
+    "descr": "nma"
+}
