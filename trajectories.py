@@ -1,199 +1,165 @@
 import numpy as np
-import scipy.io as sio
 import numpy.typing as npt
+import vibrations as vib
 from typing import Union
-import os
-import natsort
-from io import StringIO
+import plotting as plot
 
 
-def read_trajs_from_xyz(fpaths: str, code_type: str, natom: int) -> tuple[npt.NDArray, npt.NDArray, int]:
-    # reads trajectories specified in every subdir listed in the parent dir fpaths
-    # filters all possible subdirs down to suitable trajectory ones on the basis they contain the file traj_file and it is readable
-    # by default it currently reads only SHARC files but can be easily extended
-    # returns a np array of shape [natom, 3, ntraj, nts] where nts = maximum run time over all trajs read in
-    # trajs that crash before nts have subsequent elements set to NaN
-    # also returns a list of each trajs run time and the total num. of trajs
-    if code_type == 'sharc':
-        traj_file = 'output.xyz'
+##########################################################################################################
+# Author: Kyle Acheson
+# A module to perform normal mode analysis on a single or ensemble of trajectories                       #
+# given a set of normal mode coordinates it can be used to determine the activity of each normal mode    #
+# allows analysis over a set of requested time intervals or the whole trajectory run time                #
+# also includes various other utilities for analysing trajectories                                       #
+##########################################################################################################
+
+
+def ensemble_analysis(norm_mode_trajs: npt.NDArray, traj_time_count: npt.NDArray, time_intervals:npt.NDArray) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
+    # performs analysis over the whole ensemble of trajectories
+    # gives the average set of normal mode coordinates and the standard deviation of each mode
+    # from the mean trajectory - also gives the total standard deviation of each mode
+    # averaged across specified time intervals (by call to ensemble_tint_analysis)
+    sz = np.shape(norm_mode_trajs)
+    nvibs, traj, nts = sz[0], sz[1], sz[2]
+    ntints = np.shape(time_intervals)[1]
+    traj_avg_std = np.zeros((nvibs, nts), float)
+    traj_avg_norm_modes = np.zeros((nvibs, nts), float)
+    traj_sum = np.nansum(norm_mode_trajs, axis=1)
+    traj_sum_sq = np.nansum(norm_mode_trajs**2, axis=1)
+    exclude_traj_timesteps = np.where(traj_time_count == 0)[0].tolist()
+
+    if len(exclude_traj_timesteps) > 0:
+        print("No trajectories run to: %s timesteps - analysis truncated at previous timestep." % exclude_traj_timesteps)
+
+    for i in range(nts):
+        for j in range(nvibs):
+            traj_avg_int = traj_sum[j, i] / traj_time_count[i]
+            traj_avg_int_sq = traj_sum_sq[j, i] / traj_time_count[i]
+            traj_avg_norm_modes[j, i] = traj_avg_int # norm modes averaged over all trajs
+            std_traj = (traj_time_count[i] / (traj_time_count[i] - 1) * (traj_avg_int_sq - traj_avg_int ** 2)) ** 0.5
+            traj_avg_std[j, i] = std_traj  # std of each nm over time on average traj
+
+    avg_tint_std = ensemble_tint_analysis(traj_avg_norm_modes, time_intervals)
+    return traj_avg_std, traj_avg_norm_modes, avg_tint_std
+
+
+def ensemble_tint_analysis(traj_avg_norm_modes: npt.NDArray, time_intervals: npt.NDArray) -> Union[npt.NDArray, None]:
+    # calculates standard deviation from the mean trajectory for each specified time interval
+    # only possible if the specified time intervals are the same for every trajectory
+    nvibs = np.shape(traj_avg_norm_modes)[0]
+    ntints = np.shape(time_intervals)[1]
+    avg_tint_std = np.zeros((nvibs, ntints), float)
+    if len(np.unique(time_intervals, axis=2)) == ntints:
+        for i in range(ntints):
+            tint = time_intervals[:, i, 0]
+            tstart, tend = int(tint[0]), int(tint[1])
+            tdiff = tend - tstart
+            avg_all_tint = np.nansum(traj_avg_norm_modes[:, tstart:tend], axis=1) / tdiff
+            avg_sq_all_tint = np.nansum(traj_avg_norm_modes[:, tstart:tend]**2, axis=1) / tdiff
+            avg_tint_std[:, i] = (tdiff/ (tdiff-1) * (avg_sq_all_tint - avg_all_tint ** 2)) ** 0.5
+            # av_tint_std = av_tint_std * mult_array
+            # std of averaged trajectories within each time interval
+        return avg_tint_std
+
     else:
-        print("Only SHARC trajectories currently available.")
-
-    dirs = [(fpaths + '/' + d) for d in os.listdir(fpaths) if os.path.isdir(fpaths + '/' + d)]
-    dirs = [d for d in dirs if os.path.isfile(d + '/' + traj_file)]
-    dirs = natsort.natsorted(dirs)
-    if len(dirs) < 1:
-        raise Exception("No directories containing trajectories found. Please check cwd.")
-    fpaths = [(f + '/' + traj_file) for f in dirs]
-    print("Attempting to read in %s trajectories from xyz files" % len(fpaths))
-    all_trajs, run_times, ntraj = load_trajs_xyz(fpaths, natom, 'sharc') # currently default is SHARC only
-    trajs = format_traj_array(all_trajs, run_times, natom, ntraj)
-    run_times = format_traj_run_times(run_times)
-    return trajs, run_times, ntraj
+        print("""Can not perform std calculation over specified time intervals for mean trajectories as time
+              intervals are not consistant over all trajectories.""")
+        return None
 
 
-def format_traj_array(traj_list: list, run_times: list, natom : int, ntraj : int) -> npt.NDArray:
-    # formats nested list of trajectories into a np array of dimensions (natom, 3, ntraj, nts)
-    # trajs might not all run over time frame, therefore nts is taken to be the longest
-    # run time of all trajectories together. For trajectories that crash before the int nts,
-    # the subsequent array indexes are filled with NaN
+def single_traj_nma(trajectories: npt.NDArray, ref_atoms: npt.NDArray,
+                    norm_mode_mat: npt.NDArray, time_intervals: npt.NDArray, ntints: int, nvibs: int):
+    # performs normal mode analysis on a single trajectory
+    # does transformation to normal mode coordinates
+    # also calculates the average traj in norm mode coords over a series of time intervals
+    # calculates standard dev on the average over each time interval by call to calc_traj_std
+    ntraj = np.shape(trajectories)[2]
+    nts = np.shape(trajectories)[3]
+    norm_mode_trajs = np.zeros((nvibs, ntraj, nts))
+    interval_recs = np.zeros((ntints, ntraj))
+    interval_stds = np.zeros((nvibs, ntints, ntraj), float)
+    interval_avg = np.zeros((nvibs, ntints, ntraj), float)
+    traj_std = np.zeros((nvibs, ntints, ntraj), float)
+    traj_time_count = np.zeros((nts), int)
 
-    max_run_time = max(run_times)
-    trajs = np.full((natom, 3, ntraj, max_run_time), np.nan)
-    for i in range(ntraj):
-        run_time = run_times[i]
-        trajs[:, :, i, 0:run_time] = np.swapaxes(np.swapaxes(np.array(traj_list[i]), 0, 2), 0, 1) # must do some reshaping
-    return trajs
-
-
-def load_trajs_xyz(fpaths: list, natom: int, traj_type: str = 'sharc') -> tuple[list, list, int]:
-    # iterates over file paths for all trajectories in subdirs and returns
-    # all suitable trajs in a nested list along with the run time for each traj simulation and the total traj number
-    # currently only works for SHARC formatted trajectory files (see call to read_sharc() func)
-    # can further extend to other quantum codes by adding a suitable function that returns a
-    # list of trajs and their corrosponding run times
-    run_times = []
-    all_trajs = []
-    ntraj = 0
-    for idx, fpath in enumerate(fpaths):
-        with open(fpath, 'r') as trj_file:
-
-            if traj_type.lower() == 'sharc':
-                traj_coords, traj_nts = read_sharc(trj_file, natom)
-            else:
-                pass # extend to other quantum md code readers if needed - write another function like read_sharc to call
-
-            if traj_nts > 1:
-                ntraj += 1
-                run_times.append(traj_nts)
-                all_trajs.append(traj_coords)
-            else:
-                print("%s contains less than one time step - excluding from analysis." % fpath)
-    return all_trajs, run_times, ntraj
-
-
-def read_sharc(trj_file: str, natom: int) -> tuple[list, int]:
-    # reads SHARC style trajectory files in xyz files
-    # returns a list of a single trajectories coordinates and its run time
-    count = 0
-    na = 0
-    nts = 0
-    geom_all = []
-    geom_temp = []
-    for idx, line in enumerate(trj_file):
-        idx += 1
-        count += 1
-        if count > 2:
-            atom_coord = np.genfromtxt(StringIO(line))[1:4].tolist()
-            geom_temp.append(atom_coord)
-            na += 1
-        if na == natom:
-            na = 0
-            count = 0
-            nts += 1
-            geom_all.append(geom_temp)
-            geom_temp = []
-
-    return geom_all, nts
-
-
-def read_mat(filename: str, var_names: list):
-    # parses and reads in input arrays in .mat or .npy format
-    file_type = filename.split('.')[-1]
-    if file_type == 'npy':
-        arr = np.load(filename)
-    elif file_type == 'mat':
-        arr = sio.loadmat(filename)
-        keys = [k for k in arr if '__' not in k]
-        if len(keys) > 1 and var_names is None:
-            raise TypeError('.Mat file must have only one variable')
-        elif len(keys) > 1 and var_names is not None:
-            arr = get_mat_vars(arr, var_names, keys)
-        else:
-            key_val = keys[0]
-            arr = arr[key_val]
-    else:
-        raise TypeError('Input file must be .npy or .mat')
-
-    return arr
-
-
-def get_mat_vars(arr: dict, var_names: list, keys: list) -> list:
-    # extracts only desired variables from a .mat file
-    # INPUTS:
-    # Vars - variables to be extracted from .mat file
-    # Arr - .mat file variables loaded into a dict
-    # Keys - all variables listed in Arr
-    # OUTPUTS:
-    # arrs - list of np.arrays of each variable
-    inds = [i for i, k in enumerate(keys) if k in var_names]
-    arrs = []
-    for i in range(len(inds)):
-        arrs.append(arr[keys[inds[i]]])
-    return arrs
-
-
-def load_trajs(traj_file: str, natom:int, nts: int) -> tuple[npt.NDArray, int]:
-    trajectories = read_mat(traj_file, [])
-    trz = np.shape(trajectories)
-    if trz[0] != natom and trz[1] != 3 and trz[3] != nts:
-        raise Exception("Trajectories must be stored in format [natom, 3, ntraj, nts]")
-    ntraj = trz[2]
-    return trajectories, ntraj
-
-
-def format_traj_run_times(run_times: list) -> npt.NDArray:
-    # formats run_times read from xyz files for a series of trajs
-    # into a time interval array
-    ntraj = len(run_times)
-    time_intervals = np.zeros((2, 1, ntraj))
+    #traj_std_b = np.zeros((nvibs, ntints, ntraj), float)
+    #interval_avg_b = np.zeros((nvibs, ntints, ntraj), float)
     for traj in range(ntraj):
-        end_time = run_times[traj]
-        tint = np.array([0, end_time])
-        time_intervals[:, :, traj] = np.zeros((2, 1)) + tint[:, None]
-    return time_intervals
+        trajectory = trajectories[:,:,traj,:]
+        norm_mode_coords = vib.norm_mode_basis(trajectory, nts, nvibs, ref_atoms, norm_mode_mat)
+        norm_mode_trajs[:, traj, :] = norm_mode_coords
+        traj_time_intervals = time_intervals[:, :, traj]
+        interval_rec, interval_std, interval_summed, interval_summed_sq, avg_tint = calc_traj_std(norm_mode_coords, traj_time_intervals, ntints, nvibs, traj)
+        traj_std[:, :, traj] = interval_std
+        interval_avg[:, :, traj] = avg_tint
+        interval_recs[:, traj] = interval_rec
+        interval_stds[:, :, traj] = interval_std
+        #traj_std[:, :, traj], interval_avg[:, :, traj] = trg.tint_averaging(interval_summed, interval_summed_sq, interval_rec, ntints, nvibs)
+        # for each traj - std and average of nm over time intervals
+        plot.plot_single_traj(norm_mode_coords, avg_tint, interval_std, traj_time_intervals)
+        traj_time_count += count_traj_timesteps(trajectory, nts)
+
+    return norm_mode_trajs, traj_std, interval_avg, traj_time_count
 
 
+def calc_traj_std(norm_mode_coords: npt.NDArray, time_intervals: npt.NDArray, ntints: int, nvibs: int, traj: int):
+    # calculates the std and average of normal modes over specified time intervals for single trajectory
 
-def load_time_intervals(tints_file: str, ntraj: int) -> tuple[npt.NDArray, int]:
-    # load time_intervals from an existing file and format by projecting each interval
-    # over all trajectories if required. Always returns tints in form [2, num_intervals, ntraj]
-    # where the intervals for each traj can be the same, or different - depending on input array
-    tints = read_mat(tints_file, [])
-    tisz = np.shape(tints)
-    ntints = tisz[1]
-    if tisz[2] != ntraj and tisz[2] == 1:
-        tints = np.zeros((2, ntints, ntraj)) + tints[:, :, None] # project the ntints time intervals over all trajs
-    elif tisz[2] != ntraj and tisz[2] != 1: # error if incorrect format
-        raise Exception("Time interval array must be in format [2, num_intervals, x] where x = 1 or ntraj.")
-    else:
-        pass # if already in format [2, num_intervals, ntraj] do nothing
-    return tints, ntints
+    # set up record array over specified time intervals - given for every traj as intervals may vary per traj if specified
+    # all arrays are initialised with nan's in event time interval does not exist for trajectory in question
+    interval_rec = np.full((ntints), np.nan) # time interval lengths for each trajectory
+    interval_summed = np.full((nvibs, ntints), np.nan) # sum over time for each time interval and normal mode
+    interval_summed_sq = np.full((nvibs, ntints), np.nan) # squared sum over time for each time interval and normal mode
+    interval_std = np.full((nvibs, ntints), np.nan) # standard deviation over the duration of the specified intervals
+    interval_avg = np.full((nvibs, ntints), np.nan)
 
+    for j in range(ntints):
+        tint = time_intervals[:, j]
+        tstart, tend = int(tint[0]), int(tint[1])
+        tdiff = tend - tstart
+        norm_mode_coord = norm_mode_coords[:,tstart:tend]
+        if np.isnan(norm_mode_coord).any():
+            print("Trajectory %s terminates before time interval %s (tstart: %s, tend: %s)" % (traj, j, tstart, tend))
+            tend = min(list(map(tuple, np.where(np.isnan(norm_mode_coord))))[1])
+            tdiff = tend # rassign to timepoint traj crashes at
+            print("Only including trajectory up till its termination point: %s." % (tend + tstart))
+        interval_rec[j] = tdiff # length in time each interval is recorded over
+        summed_tint = np.nansum(norm_mode_coord, axis=1) # sum over time interval for each mode
+        interval_summed[:, j] = summed_tint
+        summed_sq_tint = np.nansum(norm_mode_coord**2, axis=1) # squared sum of normal modes over time interval
+        interval_summed_sq[:, j] = summed_sq_tint
 
+        if tdiff != 0:
+            avg_tint = summed_tint / tdiff
+            interval_avg[:, j] = avg_tint
+            avg_sq_tint = summed_sq_tint / tdiff
+            interval_std[:, j] = (tdiff / (tdiff - 1) * (avg_sq_tint - avg_tint ** 2)) ** .5
 
-def format_time_intervals(tints: list, ntraj: int) -> tuple[npt.NDArray, int]:
-    # if time intervals given in a user specified list and NOT read in from external file
-    # project every time interval for all trajs - each traj will have the same time intervals
-    ntints = len(tints)
-    tints_arr = np.zeros((2, ntints, ntraj))
-    for i in range(ntints):
-        tint = np.array(tints[i])
-        tints_arr[:, i, :] = np.zeros((2,ntraj)) + tint[:,None]
-    return tints_arr, ntints
-
-
-def get_time_intervals(time_intervals: Union[str, list], ntraj: int) -> tuple[npt.NDArray, int]:
-    # if a string is specified - read time intervals from external file
-    # else calculate them over all trajs for the user specified list
-    if type(time_intervals) == str: # load from external file
-        time_intervals, ntints = load_time_intervals(time_intervals, ntraj)
-    else:
-        time_intervals, ntints = format_time_intervals(time_intervals, ntraj)
-    return time_intervals, ntints
+    return interval_rec, interval_std, interval_summed, interval_summed_sq, interval_avg
 
 
-if __name__ == "__main__":
-    cwd = '/Users/kyleacheson/PycharmProjects/SHARC_NMA'
-    atoms = ["C", "S","S"]
-    read_trajs_from_xyz(cwd, 'output.xyz', atoms)
+def count_traj_timesteps(trajectory: npt.NDArray, nts: int):
+    # adds +1 to timesteps that are present in a trajectory
+    # returns vector of size nts with 1 and 0 corrosponding to
+    # if the trajectory calculation exists at specified time step
+    time_count = np.zeros((nts), int)
+    for i in range(nts):
+        if not np.isnan(trajectory[:, :, i]).any():
+            time_count[i] += 1
+    return time_count
+
+
+#def tint_averaging(interval_summed: npt.NDArray, interval_summed_sq: npt.NDArray,
+#                   interval_rec: npt.NDArray, ntints: int, nvibs: int) -> tuple[npt.NDArray, npt.NDArray]:
+#    # this function is redundant - used in old implimentation
+#    std_tint = np.zeros((nvibs, ntints,), float)
+#    tint_avg = np.zeros((nvibs, ntints), float)
+#    for j in range(ntints):
+#        int_avg = interval_summed[:, j] / interval_rec[j]
+#        int_avg_sq = interval_summed_sq[:, j] / interval_rec[j]
+#        std = (interval_rec[j] / (interval_rec[j] - 1) * (int_avg_sq - int_avg ** 2)) ** 0.5
+#        std_tint[:, j] = std;
+#        tint_avg[:, j] = int_avg;
+#        # mult std by mult array here
+#    return std_tint, tint_avg
+

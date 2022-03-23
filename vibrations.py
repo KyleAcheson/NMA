@@ -5,7 +5,7 @@ import numpy.typing as npt
 au2ang = 1
 
 
-def read_molden_freqs(file_path: str) -> tuple[list, list, list, npt.NDArray]:
+def molden_freqs(file_path: str) -> tuple[list, list, list, npt.NDArray]:
 
     atoms, freqs, vibs = [], [], []
 
